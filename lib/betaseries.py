@@ -5,11 +5,12 @@ import requests
 import zipfile
 import tarfile
 import os
+from datetime import datetime
 from lib.betaseries_exception import ConnectionError
 
 # Const
 BS_URL = 'https://api.betaseries.com'
-VERSION = 'v=2.3'
+VERSION = '3.0'
 
 
 def convert(input):
@@ -30,8 +31,9 @@ def convert(input):
         return input
 
 
-def json_decode(url):
-    r = requests.get(url)
+def json_decode(url, headers={}):
+    r = requests.get(url, headers=headers)
+    r.raise_for_status()
     json = r.json()
 
     return json
@@ -60,6 +62,10 @@ class BetaSeries(object):
 
     def __init__(self):
         self._key = None
+        self._secret = None
+        self._user_token = None
+        self._shows = []
+        self._downloaded = None
 
     def set_key(self, key):
         if not BetaSeries._verify_connection(key):
@@ -68,8 +74,16 @@ class BetaSeries(object):
 
     def get_key(self):
         if not self._key:
-            raise ConnectionError('No valid key enter')
+            raise ConnectionError('Missing application key')
         return self._key
+
+    def set_secret(self, secret):
+        self._secret = secret
+
+    def get_secret(self):
+        if not self._secret:
+            raise ConnectionError('Missing application secret')
+        return self._secret
 
     @staticmethod
     def _verify_connection(key):
@@ -78,6 +92,67 @@ class BetaSeries(object):
         return requests.get(url).status_code == 200
 
     key = property(fset=set_key, fget=get_key)
+
+    secret = property(fset=set_secret, fget=get_secret)
+
+    def login(self, consumer_token=None):
+        if consumer_token is None:
+            print("Please proceed to : https://www.betaseries.com/authorize?client_id={}&redirect_uri=http://localhost:8080".format(self.key))
+            consumer_token = raw_input("Provide the user token (you can find it at the end of the URL after you logged in): ")
+
+        url = BS_URL + '/oauth/access_token'
+        r = requests.post(url, json=dict(client_id=self.key, client_secret=self.secret, redirect_uri="http://localhost:8080", code=consumer_token))
+        r.raise_for_status()
+
+        self._user_token = r.json()['access_token']
+
+    def get_headers(self):
+        headers = {"X-BetaSeries-Key": self.get_key(), 'X-BetaSeries-Version': VERSION}
+        if self._user_token:
+            headers['Authorization'] = 'Bearer {}'.format(self._user_token)
+
+        return headers
+
+    def list_shows(self):
+        self.ensure_user_connected()
+        url = BS_URL + '/members/infos'
+        json = json_decode(url, headers=self.get_headers())
+
+        self._downloaded = json['member']['options']['downloaded']
+        for show in json['member']['shows']:
+            self._shows.append(Show(show))
+
+        return self._shows
+
+    def list_episodes(self, limit=1, subtitles=None):
+        self.ensure_user_connected()
+        url = BS_URL + '/episodes/list'
+        params = dict(limit=limit, released=1, order="smart")
+        if subtitles:
+            params['subtitles'] = subtitles
+
+        r = requests.get(url, params=params, headers=self.get_headers())
+        r.raise_for_status()
+        return r.json()
+
+
+    def ensure_user_connected(self):
+        if self._user_token:
+            return
+        raise ConnectionError('User not connected')
+
+    @property
+    def allow_downloaded(self):
+        self.ensure_user_connected()
+        if self._downloaded is not None:
+            return self._downloaded
+
+        url = BS_URL + '/members/infos'
+        json = json_decode(url, headers=self.get_headers())
+
+        self._downloaded = json['member']['options']['downloaded']
+        return self._downloaded
+
 
 
 class Show():
@@ -90,11 +165,14 @@ class Show():
         self.data = data
         self._episodes = self._get_episodes()
 
+    @property
+    def imdb_id(self):
+        return self.data.get('imdb_id')
+
     @staticmethod
     def search(keyword):
-        url = BS_URL + '/shows/search?' + VERSION + '&key=' + Show.b.key + '&title=' + keyword
-        r = requests.get(url)
-        json = r.json()
+        url = BS_URL + '/shows/search?title=' + keyword
+        json = json_decode(url, headers=Show.b.get_headers())
 
         list_shows = []
 
@@ -104,8 +182,8 @@ class Show():
         return list_shows
 
     def _get_episodes(self):
-        url = BS_URL + '/shows/episodes?' + VERSION + '&key=' + Show.b.key + '&id=' + str(self.data['id'])
-        json = json_decode(url)
+        url = BS_URL + '/shows/episodes?id=' + str(self.data['id'])
+        json = json_decode(url, headers=Show.b.get_headers())
 
         list_episodes = []
 
@@ -125,7 +203,7 @@ class Show():
         return self.data.get('title')
 
     def __repr__(self):
-        return 'Show : ' + str(self)
+        return u'Show : ' + str(self)
 
 
 class Episode():
@@ -135,9 +213,55 @@ class Episode():
     def __init__(self, data):
         self.data = data
 
+    @property
+    def season(self):
+        return self.data.get('season')
+
+    @property
+    def episode(self):
+        return self.data.get('episode')
+
+    @property
+    def downloaded(self):
+        if not 'user' in self.data:
+            return None
+        return self.data['user'].get('downloaded')
+
+    @property
+    def seen(self):
+        if not 'user' in self.data:
+            return None
+        return self.data['user'].get('seen')
+
+    @property
+    def code(self):
+        return self.data.get('code')
+
+    @property
+    def date(self):
+        if not self.data.get('date'):
+            return None
+
+        splitted_date = self.data['date'].split('-')
+        return datetime(year=int(splitted_date[0]),
+                        month=int(splitted_date[1]),
+                        day=int(splitted_date[2]))
+
+    @property
+    def released(self):
+        released_date = self.date
+        if not released_date:
+            return None
+
+        return datetime.today() > self.date
+
+    @property
+    def special(self):
+        return bool(self.data.get('special'))
+
     def _get_subtitles(self):
-        url = BS_URL + '/subtitles/episode?' + VERSION + '&key=' + Episode.b.key + '&id=' + str(self.data['id'])
-        json = json_decode(url)
+        url = BS_URL + '/subtitles/episode?id=' + str(self.data['id'])
+        json = json_decode(url, headers=Episode.b.get_headers())
 
         list_subtitle = []
 
@@ -146,8 +270,43 @@ class Episode():
 
         return list_subtitle
 
+    def mark_as_seen(self):
+        Episode.b.ensure_user_connected()
+        url = BS_URL + '/episodes/watched'
+        r = requests.post(url, json=dict(id=str(self.data['id']), bulk=False, delete=False), headers=Episode.b.get_headers())
+        r.raise_for_status()
+        json = r.json()
+
+    def mark_as_unseen(self):
+        Episode.b.ensure_user_connected()
+        url = BS_URL + '/episodes/watched?id=' + str(self.data['id'])
+        r = requests.delete(url, headers=Episode.b.get_headers())
+        r.raise_for_status()
+        json = r.json()
+
+
+    def mark_as_downloaded(self):
+        Episode.b.ensure_user_connected()
+        if not Episode.b.allow_downloaded:
+            raise ValueError("Can't mark as downloaded as option 'downloaded' not enabled on this account")
+
+        url = BS_URL + '/episodes/downloaded'
+        r = requests.post(url, json=dict(id=str(self.data['id']), bulk=False, delete=False), headers=Episode.b.get_headers())
+        r.raise_for_status()
+        json = r.json()
+
+    def mark_as_undownloaded(self):
+        Episode.b.ensure_user_connected()
+        if not Episode.b.allow_downloaded:
+            raise ValueError("Can't mark as undownloaded as option 'downloaded' not enabled on this account")
+
+        url = BS_URL + '/episodes/downloaded?id=' + str(self.data['id'])
+        r = requests.delete(url, headers=Episode.b.get_headers())
+        r.raise_for_status()
+        json = r.json()
+
     def __str__(self):
-        return self.data.get('title')
+        return u'{} {}'.format(self.code, self.data.get('title'))
 
     def __repr__(self):
         return 'Episode : ' + str(self)
